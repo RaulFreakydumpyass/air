@@ -35,7 +35,15 @@ import androidx.compose.ui.unit.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import android.content.Context
 import android.content.SharedPreferences
+import androidx.work.CoroutineWorker
+import androidx.work.ExistingWorkPolicy
+import androidx.work.ListenableWorker
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkManager
+import androidx.work.WorkerParameters
+import java.util.concurrent.TimeUnit
 import android.util.Base64
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
@@ -67,16 +75,10 @@ enum class Fan(val label: String) { AUTO("Auto"), LOW("Low"), MED("Medium"), HIG
 data class AcState(
     val power: Boolean = true, val mode: Mode = Mode.COOL, val target: Float = 24f, val room: Float = 27.5f,
     val humidity: Int? = 48, val fan: Fan = Fan.AUTO, val swingV: Boolean = false, val swingH: Boolean = false,
-    val sleep: Boolean = false, val curve: Int = 2, val health: Boolean = false, val clean: Boolean = false,
-    val display: Boolean = true, val timerOff: Int = 0,
+    val sleep: Boolean = false, val health: Boolean = false, val clean: Boolean = false,
+    val display: Boolean = true,
 )
 
-/** Sleep curves: how far the temperature drifts from your setting, hour by hour over 8 hours. */
-val CURVES = listOf(
-    "Steady" to listOf(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f),
-    "Light" to listOf(0f, 0f, 1f, 1f, 1f, 1f, 0f, 0f),
-    "Standard" to listOf(0f, 1f, 2f, 2f, 2f, 2f, 1f, 0f),
-)
 
 /** The only thing that touches the air conditioner. Swap DemoBackend for a real one (AUX Cloud or LAN). */
 interface AcBackend { suspend fun read(): AcState; suspend fun write(s: AcState) }
@@ -181,38 +183,42 @@ fun fmt(v: Float) = if (v % 1f == 0f) "${v.toInt()}" else "${v.toInt()}.5"
 
 // ---------- Screen ----------
 @Composable
-fun App(backend: AcBackend?, onLogin: (String, String, String) -> Unit, onLogout: () -> Unit) {
+fun App(
+    backend: AcBackend?, resumeTick: Int, timerEnd0: Long, timerSel0: Int, onTimer: (Int) -> Long,
+    onLogin: (String, String, String) -> Unit, onLogout: () -> Unit
+) {
     var st by remember(backend) { mutableStateOf(AcState()) }
     var err by remember(backend) { mutableStateOf<String?>(null) }
     var ready by remember(backend) { mutableStateOf(false) }
-    var touched by remember { mutableStateOf(0L) }
-    val scope = rememberCoroutineScope()
-    LaunchedEffect(backend) {
+    var pending by remember(backend) { mutableStateOf<AcState?>(null) }
+    var manual by remember { mutableStateOf(0) }
+    // Reads the AC only when the app opens, comes back to the screen, or you tap Refresh.
+    LaunchedEffect(backend, resumeTick, manual) {
         val b = backend ?: return@LaunchedEffect
-        while (true) {
-            try {
-                val r = b.read()
-                if (System.currentTimeMillis() - touched > 8000) st = r.copy(timerOff = st.timerOff, curve = st.curve)
-                ready = true; err = null
-            } catch (e: Exception) {
-                err = e.message ?: e.toString()
-                if (e is AuxError && e.bad) return@LaunchedEffect
-            }
-            delay(5000)
+        if (pending != null) return@LaunchedEffect
+        try { st = b.read(); ready = true; err = null } catch (e: Exception) { err = e.message ?: e.toString() }
+    }
+    // Sends only when you changed something: changes are collected for 3 seconds, then sent together in one request.
+    LaunchedEffect(backend, pending != null) {
+        val b = backend ?: return@LaunchedEffect
+        while (pending != null) {
+            delay(3000)
+            val p = pending ?: break
+            try { b.write(p); err = null } catch (e: Exception) { err = e.message ?: e.toString() }
+            if (pending === p) pending = null
         }
     }
     fun set(n: AcState) {
-        st = n; touched = System.currentTimeMillis()
-        val b = backend ?: return
-        scope.launch { try { b.write(n); err = null } catch (e: Exception) { err = e.message ?: e.toString() } }
+        st = n
+        if (backend != null) pending = n
     }
 
-    LaunchedEffect(st.timerOff > 0) {
-        while (st.timerOff > 0) {
-            delay(60_000)
-            if (st.timerOff > 1) set(st.copy(timerOff = st.timerOff - 1)) else set(st.copy(timerOff = 0, power = false))
-        }
-    }
+    var timerEnd by remember { mutableStateOf(timerEnd0) }
+    var timerSel by remember { mutableStateOf(timerSel0) }
+    var now by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) { while (true) { delay(10_000); now = System.currentTimeMillis() } }
+    LaunchedEffect(now) { if (timerEnd != 0L && now >= timerEnd) { timerEnd = 0L; timerSel = 0 } }
+    val remaining = if (timerEnd > now) ((timerEnd - now + 59_999) / 60_000).toInt() else 0
 
     val cols = palette(st).map { animateColorAsState(it, tween(1200), label = "c").value }
     val phase = rememberInfiniteTransition(label = "p")
@@ -247,6 +253,7 @@ fun App(backend: AcBackend?, onLogin: (String, String, String) -> Unit, onLogout
                 else if (!ready) Glass(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         Text(if (err == null) "Connecting to your AC..." else "Could not connect: $err", color = Color.White, fontSize = 15.sp)
+                        if (err != null) Pill("Try again", true, Modifier.fillMaxWidth()) { manual++ }
                         Pill("Log out", false, Modifier.fillMaxWidth()) { onLogout() }
                     }
                 } else {
@@ -297,12 +304,12 @@ fun App(backend: AcBackend?, onLogin: (String, String, String) -> Unit, onLogout
                 Glass(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         Text(
-                            if (st.timerOff > 0) "Turns off in ${st.timerOff / 60}h ${st.timerOff % 60}m" else "Turn off after",
+                            if (remaining > 0) "Turns off in ${remaining / 60}h ${remaining % 60}m" else "Turn off after",
                             color = Color.White.copy(.8f), fontSize = 14.sp
                         )
                         Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             listOf(0 to "No timer", 30 to "30 min", 60 to "1 hour", 120 to "2 hours", 240 to "4 hours", 480 to "8 hours").forEach { (m, l) ->
-                                Pill(l, m == 0 && st.timerOff == 0) { set(st.copy(timerOff = m)) }
+                                Pill(l, timerSel == m) { timerSel = m; timerEnd = onTimer(m); now = System.currentTimeMillis() }
                             }
                         }
                     }
@@ -319,34 +326,16 @@ fun App(backend: AcBackend?, onLogin: (String, String, String) -> Unit, onLogout
                     }
                 }
 
-                if (st.sleep) Glass(Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Text("Sleep curve preview (not sent to the AC)", color = Color.White.copy(.8f), fontSize = 14.sp)
-                        Canvas(Modifier.fillMaxWidth().height(70.dp)) {
-                            val pts = CURVES[st.curve].second
-                            val step = size.width / (pts.size - 1)
-                            val pad = 6.dp.toPx()
-                            val path = androidx.compose.ui.graphics.Path()
-                            pts.forEachIndexed { i, v ->
-                                val x = i * step
-                                val y = size.height - pad - (v / 2f) * (size.height - 2 * pad)
-                                if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
-                            }
-                            drawPath(path, Color.White, style = Stroke(3.dp.toPx(), cap = StrokeCap.Round))
-                        }
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            CURVES.forEachIndexed { i, c -> Pill(c.first, st.curve == i, Modifier.weight(1f)) { set(st.copy(curve = i)) } }
-                        }
-                    }
-                }
-
                 }
                 if (backend != null && ready) Text(
                     if (backend is DemoBackend) "Demo mode: changes are not sent to your air conditioner."
                     else if (err != null) "Connection problem: $err" else "Connected through AUX cloud",
                     color = Color.White.copy(.6f), fontSize = 12.sp, modifier = Modifier.padding(start = 6.dp)
                 )
-                if (backend != null && ready) Pill("Log out", false, Modifier.fillMaxWidth()) { onLogout() }
+                if (backend != null && ready) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Pill("Refresh", false, Modifier.weight(1f)) { manual++ }
+                    Pill("Log out", false, Modifier.weight(1f)) { onLogout() }
+                }
                 Spacer(Modifier.height(12.dp))
             }
         }
@@ -387,6 +376,9 @@ fun LoginCard(onLogin: (String, String, String) -> Unit) {
 }
 
 class MainActivity : ComponentActivity() {
+    private var tick by mutableStateOf(0)
+    override fun onResume() { super.onResume(); tick++ }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge(
@@ -397,16 +389,34 @@ class MainActivity : ComponentActivity() {
         setContent {
             var backend by remember { mutableStateOf(load(prefs)) }
             App(
-                backend,
+                backend, tick, prefs.getLong("timerEnd", 0L), prefs.getInt("timerSel", 0), { schedule(it, prefs) },
                 onLogin = { region, email, pw ->
                     if (region == "demo") backend = DemoBackend() else {
                         prefs.edit().putString("region", region).putString("email", email).putString("pw", pw).apply()
                         backend = AuxCloud(region, email, pw)
                     }
                 },
-                onLogout = { prefs.edit().clear().apply(); backend = null }
+                onLogout = { WorkManager.getInstance(this@MainActivity).cancelUniqueWork("off"); prefs.edit().clear().apply(); backend = null }
             )
         }
+    }
+
+    /** Schedules (or cancels) a real "turn off" that runs even when the app is closed. Returns the end time. */
+    private fun schedule(minutes: Int, prefs: SharedPreferences): Long {
+        val wm = WorkManager.getInstance(this)
+        if (minutes <= 0) {
+            wm.cancelUniqueWork("off")
+            prefs.edit().remove("timerEnd").remove("timerSel").apply()
+            return 0L
+        }
+        val end = System.currentTimeMillis() + minutes * 60_000L
+        wm.enqueueUniqueWork(
+            "off", ExistingWorkPolicy.REPLACE,
+            OneTimeWorkRequestBuilder<OffWorker>().setInitialDelay(minutes.toLong(), TimeUnit.MINUTES)
+                .setConstraints(androidx.work.Constraints.Builder().setRequiredNetworkType(androidx.work.NetworkType.CONNECTED).build()).build()
+        )
+        prefs.edit().putLong("timerEnd", end).putInt("timerSel", minutes).apply()
+        return end
     }
 
     private fun load(p: SharedPreferences): AcBackend? {
@@ -605,6 +615,10 @@ class AuxCloud(region: String, private val email: String, private val password: 
         )
     }
 
+    suspend fun powerOff() {
+        mutex.withLock { withContext(Dispatchers.IO) { guarded { call(findDevice(), "set", listOf("pwr"), listOf<Any>(0)) } } }
+    }
+
     override suspend fun read(): AcState = mutex.withLock {
         withContext(Dispatchers.IO) { guarded { val d = findDevice(); toState(call(d, "get", emptyList(), null)).also { last = it } } }
     }
@@ -634,6 +648,21 @@ class AuxCloud(region: String, private val email: String, private val password: 
                     last = s
                 }
             }
+        }
+    }
+}
+
+/** Runs when the timer ends, even if the app is closed (Android may delay it a few minutes while the phone is idle). */
+class OffWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
+    override suspend fun doWork(): ListenableWorker.Result {
+        val p = applicationContext.getSharedPreferences("air", Context.MODE_PRIVATE)
+        val email = p.getString("email", null) ?: return ListenableWorker.Result.success()
+        return try {
+            AuxCloud(p.getString("region", "eu") ?: "eu", email, p.getString("pw", "") ?: "").powerOff()
+            p.edit().remove("timerEnd").remove("timerSel").apply()
+            ListenableWorker.Result.success()
+        } catch (e: Exception) {
+            if (runAttemptCount < 3) ListenableWorker.Result.retry() else ListenableWorker.Result.failure()
         }
     }
 }
