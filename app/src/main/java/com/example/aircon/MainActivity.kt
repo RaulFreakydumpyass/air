@@ -35,12 +35,26 @@ import androidx.compose.ui.unit.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
-import java.net.SocketTimeoutException
-import java.util.Calendar
-import java.util.TimeZone
+import android.content.SharedPreferences
+import android.util.Base64
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import org.json.JSONArray
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+import java.security.MessageDigest
+import javax.crypto.Cipher
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
 import kotlinx.coroutines.launch
 import kotlin.math.*
 
@@ -52,7 +66,7 @@ enum class Fan(val label: String) { AUTO("Auto"), LOW("Low"), MED("Medium"), HIG
 
 data class AcState(
     val power: Boolean = true, val mode: Mode = Mode.COOL, val target: Float = 24f, val room: Float = 27.5f,
-    val humidity: Int = 48, val fan: Fan = Fan.AUTO, val swingV: Boolean = false, val swingH: Boolean = false,
+    val humidity: Int? = 48, val fan: Fan = Fan.AUTO, val swingV: Boolean = false, val swingH: Boolean = false,
     val sleep: Boolean = false, val curve: Int = 2, val health: Boolean = false, val clean: Boolean = false,
     val display: Boolean = true, val timerOff: Int = 0,
 )
@@ -167,23 +181,30 @@ fun fmt(v: Float) = if (v % 1f == 0f) "${v.toInt()}" else "${v.toInt()}.5"
 
 // ---------- Screen ----------
 @Composable
-fun App(backend: AcBackend) {
-    var st by remember { mutableStateOf(AcState()) }
+fun App(backend: AcBackend?, onLogin: (String, String, String) -> Unit, onLogout: () -> Unit) {
+    var st by remember(backend) { mutableStateOf(AcState()) }
+    var err by remember(backend) { mutableStateOf<String?>(null) }
+    var ready by remember(backend) { mutableStateOf(false) }
+    var touched by remember { mutableStateOf(0L) }
     val scope = rememberCoroutineScope()
-    LaunchedEffect(Unit) { while (true) { st = backend.read(); delay(5000) } }
-    fun set(n: AcState) { st = n; scope.launch { backend.write(n) } }
-    var scanning by remember { mutableStateOf(false) }
-    var scanText by remember { mutableStateOf("") }
-    fun scan() {
-        scanning = true; scanText = "Searching for 5 seconds..."
-        scope.launch {
-            scanText = try {
-                val r = scanLan()
-                if (r.isEmpty()) "Nothing answered. Check the phone is on the same Wi-Fi as the AC. Some units don't answer this search."
-                else r.joinToString("\n") { "Found ${it.name.ifBlank { "a device" }} at ${it.ip}, type 0x${it.type.toString(16).uppercase()}, ${if (it.locked) "locked" else "unlocked"}" }
-            } catch (e: Exception) { "Search failed: ${e.message}" }
-            scanning = false
+    LaunchedEffect(backend) {
+        val b = backend ?: return@LaunchedEffect
+        while (true) {
+            try {
+                val r = b.read()
+                if (System.currentTimeMillis() - touched > 8000) st = r.copy(timerOff = st.timerOff, curve = st.curve)
+                ready = true; err = null
+            } catch (e: Exception) {
+                err = e.message ?: e.toString()
+                if (e is AuxError && e.bad) return@LaunchedEffect
+            }
+            delay(5000)
         }
+    }
+    fun set(n: AcState) {
+        st = n; touched = System.currentTimeMillis()
+        val b = backend ?: return
+        scope.launch { try { b.write(n); err = null } catch (e: Exception) { err = e.message ?: e.toString() } }
     }
 
     LaunchedEffect(st.timerOff > 0) {
@@ -200,6 +221,7 @@ fun App(backend: AcBackend) {
     val bg: @Composable (Modifier) -> Unit = { m -> Aurora(phase, cols, m) }
 
     val verb = when (st.mode) { Mode.COOL -> "cooling to"; Mode.HEAT -> "heating to"; Mode.DRY -> "drying toward"; Mode.AUTO -> "holding"; Mode.FAN -> "moving air at" }
+    val hum = st.humidity?.let { " and $it% humidity" } ?: ""
     val feats = listOf(
         Feat("Sleep", st.sleep) { it.copy(sleep = !it.sleep) }, Feat("Health", st.health) { it.copy(health = !it.health) },
         Feat("Self clean", st.clean) { it.copy(clean = !it.clean) }, Feat("Unit display", st.display) { it.copy(display = !it.display) },
@@ -216,11 +238,18 @@ fun App(backend: AcBackend) {
                 Column(Modifier.padding(start = 6.dp, top = 8.dp)) {
                     Text("Air conditioner", color = Color.White, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
                     Text(
-                        if (st.power) "Room ${fmt(st.room)}° and ${st.humidity}% humidity, $verb ${fmt(st.target)}°" else "Off, room ${fmt(st.room)}° and ${st.humidity}% humidity",
+                        if (backend == null) "Sign in to control your AC" else if (!ready) "Connecting..." else if (st.power) "Room ${fmt(st.room)}°$hum, $verb ${fmt(st.target)}°" else "Off, room ${fmt(st.room)}°$hum",
                         color = Color.White.copy(.75f), fontSize = 15.sp
                     )
                 }
 
+                if (backend == null) LoginCard(onLogin)
+                else if (!ready) Glass(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text(if (err == null) "Connecting to your AC..." else "Could not connect: $err", color = Color.White, fontSize = 15.sp)
+                        Pill("Log out", false, Modifier.fillMaxWidth()) { onLogout() }
+                    }
+                } else {
                 Glass(Modifier.fillMaxWidth(), 40.dp) {
                     Column(Modifier.fillMaxWidth().padding(vertical = 22.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                         Box(Modifier.size(250.dp), Alignment.Center) {
@@ -292,7 +321,7 @@ fun App(backend: AcBackend) {
 
                 if (st.sleep) Glass(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Text("Sleep curve over 8 hours", color = Color.White.copy(.8f), fontSize = 14.sp)
+                        Text("Sleep curve preview (not sent to the AC)", color = Color.White.copy(.8f), fontSize = 14.sp)
                         Canvas(Modifier.fillMaxWidth().height(70.dp)) {
                             val pts = CURVES[st.curve].second
                             val step = size.width / (pts.size - 1)
@@ -311,76 +340,300 @@ fun App(backend: AcBackend) {
                     }
                 }
 
-                Glass(Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Text("Connection", color = Color.White.copy(.8f), fontSize = 14.sp)
-                        Pill(if (scanning) "Searching..." else "Find my AC on Wi-Fi", false, Modifier.fillMaxWidth()) { if (!scanning) scan() }
-                        if (scanText.isNotEmpty()) Text(scanText, color = Color.White, fontSize = 13.sp)
-                    }
                 }
-
-                Text(
-                    "Demo mode: changes are not sent to your air conditioner yet.",
-                    color = Color.White.copy(.55f), fontSize = 12.sp, modifier = Modifier.padding(start = 6.dp, bottom = 12.dp)
+                if (backend != null && ready) Text(
+                    if (backend is DemoBackend) "Demo mode: changes are not sent to your air conditioner."
+                    else if (err != null) "Connection problem: $err" else "Connected through AUX cloud",
+                    color = Color.White.copy(.6f), fontSize = 12.sp, modifier = Modifier.padding(start = 6.dp)
                 )
+                if (backend != null && ready) Pill("Log out", false, Modifier.fillMaxWidth()) { onLogout() }
+                Spacer(Modifier.height(12.dp))
             }
         }
     }
 }
 
+@Composable
+fun Field(value: String, hint: String, type: KeyboardType, secret: Boolean, onChange: (String) -> Unit) {
+    Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(Color.White.copy(.12f)).padding(horizontal = 16.dp, vertical = 14.dp)) {
+        if (value.isEmpty()) Text(hint, color = Color.White.copy(.5f), fontSize = 16.sp)
+        BasicTextField(
+            value, onChange, singleLine = true, textStyle = TextStyle(color = Color.White, fontSize = 16.sp),
+            cursorBrush = SolidColor(Color.White), keyboardOptions = KeyboardOptions(keyboardType = type),
+            visualTransformation = if (secret) PasswordVisualTransformation() else VisualTransformation.None,
+            modifier = Modifier.fillMaxWidth()
+        )
+    }
+}
+
+@Composable
+fun LoginCard(onLogin: (String, String, String) -> Unit) {
+    var region by remember { mutableStateOf("eu") }
+    var email by remember { mutableStateOf("") }
+    var pw by remember { mutableStateOf("") }
+    Glass(Modifier.fillMaxWidth(), 32.dp) {
+        Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("Sign in with your AC Freedom account", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Medium)
+            Text("Region of your account", color = Color.White.copy(.8f), fontSize = 14.sp)
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf("eu" to "Europe", "usa" to "USA", "rus" to "Russia", "cn" to "China").forEach { (k, l) -> Pill(l, region == k) { region = k } }
+            }
+            Field(email, "Email", KeyboardType.Email, false) { email = it }
+            Field(pw, "Password", KeyboardType.Password, true) { pw = it }
+            Pill("Connect", true, Modifier.fillMaxWidth()) { if (email.isNotBlank() && pw.isNotEmpty()) onLogin(region, email, pw) }
+            Pill("Try demo (no AC)", false, Modifier.fillMaxWidth()) { onLogin("demo", "", "") }
+        }
+    }
+}
+
 class MainActivity : ComponentActivity() {
-    private val backend = DemoBackend()
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
         )
-        setContent { App(backend) }
+        val prefs = getSharedPreferences("air", MODE_PRIVATE)
+        setContent {
+            var backend by remember { mutableStateOf(load(prefs)) }
+            App(
+                backend,
+                onLogin = { region, email, pw ->
+                    if (region == "demo") backend = DemoBackend() else {
+                        prefs.edit().putString("region", region).putString("email", email).putString("pw", pw).apply()
+                        backend = AuxCloud(region, email, pw)
+                    }
+                },
+                onLogout = { prefs.edit().clear().apply(); backend = null }
+            )
+        }
+    }
+
+    private fun load(p: SharedPreferences): AcBackend? {
+        val e = p.getString("email", null) ?: return null
+        return AuxCloud(p.getString("region", "eu") ?: "eu", e, p.getString("pw", "") ?: "")
     }
 }
 
-// ---------- Wi-Fi search (read-only: only looks for devices, changes nothing) ----------
-data class Found(val ip: String, val type: Int, val name: String, val locked: Boolean)
+// ---------- AUX cloud (the same service the AC Freedom app uses) ----------
+/*
+ * The login, request signing and device control below are ported from the open-source
+ * project ha-aux-cloud (https://github.com/maeek/ha-aux-cloud), used under its MIT license:
+ *
+ * MIT License
+ *
+ * Copyright (c) 2026 maeek
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+private const val TS_KEY = "kdixkdqp54545^#*"
+private const val PW_KEY = "4969fj#k23#"
+private const val BODY_KEY = "xgx3d*fe3478\$ukx"
+private const val LICENSE = "PAFbJJ3WbvDxH5vvWezXN5BujETtH/iuTtIIW5CE/SeHN7oNKqnEajgljTcL0fBQQWM0XAAAAAAnBhJyhMi7zIQMsUcwR/PEwGA3uB5HLOnr+xRrci+FwHMkUtK7v4yo0ZHa+jPvb6djelPP893k7SagmffZmOkLSOsbNs8CAqsu8HuIDs2mDQAAAAA="
+private const val LICENSE_ID = "3c015b249dd66ef0f11f9bef59ecd737"
+private const val COMPANY_ID = "48eb1b36cf0202ab2ef07b880ecda60d"
+private val IV = byteArrayOf(-22, -86, -86, 58, -69, 88, 98, -94, 25, 24, -75, 119, 29, 22, 21, -86)
+private val HALF_IDS = setOf("0000000000000000000000001f620000", "00000000000000000000000045620000", "000000000000000000000000c9100100")
+private val AC_IDS = HALF_IDS + setOf(
+    "000000000000000000000000c0620000", "0000000000000000000000002a4e0000", "0000000000000000000000007faf0000",
+    "00000000000000000000000082af0000", "00000000000000000000000028620000", "000000000000000000000000c5510000",
+    "00000000000000000000000056ac0000", "000000000000000000000000a44e0000"
+)
 
-suspend fun scanLan(): List<Found> = withContext(Dispatchers.IO) {
-    val out = mutableListOf<Found>()
-    DatagramSocket(0).use { sock ->
-        sock.broadcast = true
-        sock.soTimeout = 1000
-        val p = ByteArray(0x30)
-        val now = Calendar.getInstance()
-        val tz = TimeZone.getDefault().getOffset(now.timeInMillis) / 3600000
-        for (i in 0..3) p[8 + i] = ((tz shr (8 * i)) and 0xff).toByte()
-        val y = now.get(Calendar.YEAR)
-        p[0x0c] = (y and 0xff).toByte(); p[0x0d] = ((y shr 8) and 0xff).toByte()
-        p[0x0e] = now.get(Calendar.MINUTE).toByte(); p[0x0f] = now.get(Calendar.HOUR_OF_DAY).toByte()
-        p[0x10] = (y % 100).toByte()
-        p[0x11] = ((now.get(Calendar.DAY_OF_WEEK) + 5) % 7 + 1).toByte()
-        p[0x12] = now.get(Calendar.DAY_OF_MONTH).toByte(); p[0x13] = (now.get(Calendar.MONTH) + 1).toByte()
-        val lp = sock.localPort
-        p[0x1c] = (lp and 0xff).toByte(); p[0x1d] = ((lp shr 8) and 0xff).toByte()
-        p[0x26] = 6
-        var sum = 0xbeaf
-        for (b in p) sum += (b.toInt() and 0xff)
-        sum = sum and 0xffff
-        p[0x20] = (sum and 0xff).toByte(); p[0x21] = ((sum shr 8) and 0xff).toByte()
-        val addr = InetAddress.getByName("255.255.255.255")
-        repeat(2) { sock.send(DatagramPacket(p, p.size, addr, 80)) }
-        val end = System.currentTimeMillis() + 5000
-        val buf = ByteArray(1024)
-        while (System.currentTimeMillis() < end) {
-            try {
-                val r = DatagramPacket(buf, buf.size)
-                sock.receive(r)
-                if (r.length < 0x40) continue
-                val d = buf.copyOf(r.length)
-                val type = (d[0x34].toInt() and 0xff) or ((d[0x35].toInt() and 0xff) shl 8)
-                val name = String(d.copyOfRange(0x40, d.size).takeWhile { it.toInt() != 0 }.toByteArray(), Charsets.UTF_8)
-                val f = Found(r.address.hostAddress ?: "?", type, name, d.last().toInt() != 0)
-                if (out.none { it.ip == f.ip }) out.add(f)
-            } catch (e: SocketTimeoutException) { }
+class AuxError(val code: Int?, msg: String) : Exception(msg) {
+    val bad get() = code in setOf(-1006, -1008, -1020, -1033, -1035, -1037)
+    val expired get() = code in setOf(-30129, -1000, -1009, -1012, -3003, -49009, 10011)
+}
+
+private fun msgFor(c: Int) = when (c) {
+    -1006, -1008, -1020, -1033, -1035, -1037 -> "Email or password is wrong (or try another region)"
+    -30129, -1000, -1009, -1012, -3003, -49009, 10011 -> "Login expired"
+    -3 -> "The AC is offline or unavailable"
+    -7 -> "The AC refused the command"
+    -1036, -2001 -> "Too many requests, try again in a minute"
+    else -> "AUX cloud error $c"
+}
+
+class AuxCloud(region: String, private val email: String, private val password: String) : AcBackend {
+    private val base = mapOf(
+        "eu" to "https://app-service-deu-f0e9ebbb.smarthomecs.de",
+        "usa" to "https://app-service-usa-fd7cc04c.smarthomecs.com",
+        "cn" to "https://app-service-chn-31a93883.ibroadlink.com",
+        "rus" to "https://app-service-rus-b8bbc3be.smarthomecs.com"
+    )[region] ?: "https://app-service-deu-f0e9ebbb.smarthomecs.de"
+    private var session: String? = null
+    private var user = ""
+    private var device: JSONObject? = null
+    private var last: AcState? = null
+    private val mutex = Mutex()
+
+    private fun hex(b: ByteArray) = b.joinToString("") { "%02x".format(it.toInt() and 0xff) }
+    private fun md5(s: String) = MessageDigest.getInstance("MD5").digest(s.toByteArray())
+
+    private fun errCode(j: JSONObject): Int? {
+        fun chk(o: JSONObject?): Int? {
+            val v = o?.opt("status") ?: return null
+            val n = (v as? Number)?.toInt() ?: v.toString().toIntOrNull()
+            return if (n == null || n == 0) null else n
+        }
+        return chk(j) ?: chk(j.optJSONObject("payload")) ?: chk(j.optJSONObject("event")?.optJSONObject("payload"))
+    }
+
+    private fun post(endpoint: String, body: ByteArray = ByteArray(0), extra: Map<String, String> = emptyMap()): JSONObject {
+        val c = URL("$base/$endpoint").openConnection() as HttpURLConnection
+        try {
+            c.requestMethod = "POST"; c.connectTimeout = 10000; c.readTimeout = 15000; c.doOutput = true
+            val h = mapOf(
+                "Content-Type" to "application/x-java-serialized-object", "licenseId" to LICENSE_ID, "lid" to LICENSE_ID,
+                "language" to "en", "appVersion" to "2.2.10.456537160",
+                "User-Agent" to "Dalvik/2.1.0 (Linux; U; Android 12; SM-G991B Build/SP1A.210812.016)",
+                "system" to "android", "appPlatform" to "android", "loginsession" to (session ?: ""), "userid" to user
+            ) + extra
+            h.forEach { (k, v) -> c.setRequestProperty(k, v) }
+            c.outputStream.use { it.write(body) }
+            val status = c.responseCode
+            if (status == 401 || status == 403) throw AuxError(-1000, "Login expired")
+            val text = (if (status < 400) c.inputStream else c.errorStream)?.bufferedReader()?.use { it.readText() } ?: ""
+            if (status >= 400) throw AuxError(null, "AUX cloud answered HTTP $status")
+            val json = try { if (text.isBlank()) JSONObject() else JSONObject(text) } catch (e: Exception) { throw AuxError(null, "AUX cloud sent an unreadable answer") }
+            errCode(json)?.let { throw AuxError(it, msgFor(it)) }
+            return json
+        } finally { c.disconnect() }
+    }
+
+    private fun login() {
+        val ms = System.currentTimeMillis()
+        val ts = "${ms / 1000}.${(ms % 1000).toString().padStart(3, '0')}"
+        val json = JSONObject().put("email", email.trim().lowercase())
+            .put("password", hex(MessageDigest.getInstance("SHA-1").digest((password + PW_KEY).toByteArray())))
+            .put("companyid", COMPANY_ID).put("lid", LICENSE_ID).toString()
+        val token = hex(md5(json + BODY_KEY))
+        val plain = json.toByteArray()
+        val cipher = Cipher.getInstance("AES/CBC/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(md5(ts + TS_KEY), "AES"), IvParameterSpec(IV))
+        val enc = cipher.doFinal(plain + ByteArray(16 - plain.size % 16))
+        val r = post("account/login", enc, mapOf("timestamp" to ts, "token" to token))
+        session = r.optString("loginsession"); user = r.optString("userid")
+        if (session.isNullOrEmpty() || user.isEmpty()) { session = null; throw AuxError(null, "Login failed") }
+    }
+
+    private fun <T> guarded(block: () -> T): T = try {
+        if (session == null) login()
+        try { block() } catch (e: AuxError) { if (e.expired) { login(); block() } else throw e }
+    } catch (e: org.json.JSONException) { throw AuxError(null, "Unexpected data from AUX cloud: ${e.message}") }
+
+    private fun findDevice(): JSONObject {
+        device?.let { return it }
+        val fams = post("appsync/group/member/getfamilylist").getJSONObject("data").getJSONArray("familyList")
+        var first: JSONObject? = null
+        for (i in 0 until fams.length()) {
+            val fid = fams.getJSONObject(i).getString("familyid")
+            val r = post("appsync/group/dev/query?action=select", "{\"pids\":[]}".toByteArray(), mapOf("familyid" to fid))
+            val eps = r.optJSONObject("data")?.optJSONArray("endpoints") ?: continue
+            for (j in 0 until eps.length()) {
+                val d = eps.getJSONObject(j)
+                if (first == null) first = d
+                if (d.optString("productId") in AC_IDS) { device = d; return d }
+            }
+        }
+        device = first ?: throw AuxError(null, "No air conditioner found in this account")
+        return device!!
+    }
+
+    private fun parseStd(data: Any?): Map<String, Any?> {
+        val o = when (data) { is String -> if (data.isBlank()) return emptyMap() else JSONObject(data); is JSONObject -> data; else -> return emptyMap() }
+        val out = HashMap<String, Any?>()
+        if (!o.has("params") || !o.has("vals")) { o.keys().forEach { out[it] = o.opt(it) }; return out }
+        val ps = o.getJSONArray("params"); val vs = o.getJSONArray("vals")
+        for (i in 0 until ps.length()) out[ps.getString(i)] = vs.optJSONArray(i)?.optJSONObject(0)?.opt("val")
+        return out
+    }
+
+    private fun call(d: JSONObject, act: String, params: List<String>, vals: List<Any>?): Map<String, Any?> {
+        val raw = d.getString("cookie")
+        val ck = JSONObject(String(Base64.decode(raw + "=".repeat((4 - raw.length % 4) % 4), Base64.DEFAULT)))
+        val aes = ck.getString("aeskey"); val eid = d.getString("endpointId"); val pid = d.getString("productId")
+        val mac = d.getString("mac"); val ses = d.getString("devSession")
+        val mapped = Base64.encodeToString(
+            JSONObject().put("device", JSONObject().put("id", ck.get("terminalid")).put("key", aes).put("devSession", ses)
+                .put("aeskey", aes).put("did", eid).put("pid", pid).put("mac", mac)).toString().toByteArray(), Base64.NO_WRAP
+        )
+        val now = (System.currentTimeMillis() / 1000).toString()
+        val v = if (act == "get" && params.size == 1) JSONArray().put(JSONArray().put(JSONObject().put("val", 0).put("idx", 1)))
+        else JSONArray().also { a -> vals?.forEach { a.put(JSONArray().put(JSONObject().put("idx", 1).put("val", it))) } }
+        val dir = JSONObject()
+            .put("header", JSONObject().put("namespace", "DNA.KeyValueControl").put("name", "KeyValueControl").put("interfaceVersion", "2")
+                .put("senderId", "sdk").put("messageId", "$eid-$now").put("timstamp", now))
+            .put("endpoint", JSONObject().put("devicePairedInfo", JSONObject().put("did", eid).put("pid", pid).put("mac", mac)
+                .put("devicetypeflag", d.get("devicetypeFlag")).put("cookie", mapped))
+                .put("endpointId", eid).put("cookie", JSONObject()).put("devSession", ses))
+            .put("payload", JSONObject().put("act", act).put("params", JSONArray(params)).put("vals", v).put("did", eid))
+        val r = post("device/control/v2/sdkcontrol?license=" + URLEncoder.encode(LICENSE, "UTF-8"), JSONObject().put("directive", dir).toString().toByteArray())
+        val ev = r.optJSONObject("event") ?: throw AuxError(null, "AUX cloud sent no answer")
+        if (ev.optJSONObject("header")?.optString("name") != "Response") throw AuxError(null, "Unexpected answer from AUX cloud")
+        return parseStd(ev.optJSONObject("payload")?.opt("data"))
+    }
+
+    private fun toState(p: Map<String, Any?>): AcState {
+        fun i(k: String) = (p[k] as? Number)?.toInt()
+        val pid = device?.optString("productId") ?: ""
+        var t = i("temp") ?: 240
+        if (pid in HALF_IDS && i("ac_tempdec") == 1) t = (t / 10) * 10 + 5
+        return AcState(
+            power = i("pwr") == 1,
+            mode = when (i("ac_mode")) { 1 -> Mode.HEAT; 2 -> Mode.DRY; 3 -> Mode.FAN; 4 -> Mode.AUTO; else -> Mode.COOL },
+            target = t / 10f, room = (i("envtemp") ?: 0) / 10f, humidity = null,
+            fan = when (i("ac_mark")) { 1, 5, 6 -> Fan.LOW; 2 -> Fan.MED; 3, 7 -> Fan.HIGH; 4 -> Fan.TURBO; else -> Fan.AUTO },
+            swingV = i("ac_vdir") == 1, swingH = i("ac_hdir") == 1, sleep = i("ac_slp") == 1,
+            health = i("ac_health") == 1, clean = i("ac_clean") == 1, display = i("scrdisp") != 0
+        )
+    }
+
+    override suspend fun read(): AcState = mutex.withLock {
+        withContext(Dispatchers.IO) { guarded { val d = findDevice(); toState(call(d, "get", emptyList(), null)).also { last = it } } }
+    }
+
+    override suspend fun write(s: AcState) {
+        mutex.withLock {
+            withContext(Dispatchers.IO) {
+                guarded {
+                    val d = findDevice()
+                    val prev = last ?: toState(call(d, "get", emptyList(), null))
+                    val v = LinkedHashMap<String, Any>()
+                    if (s.power != prev.power) v["pwr"] = if (s.power) 1 else 0
+                    if (s.mode != prev.mode) v["ac_mode"] = when (s.mode) { Mode.COOL -> 0; Mode.HEAT -> 1; Mode.DRY -> 2; Mode.FAN -> 3; Mode.AUTO -> 4 }
+                    if (s.target != prev.target) {
+                        val x10 = Math.round(s.target * 10)
+                        if (d.optString("productId") in HALF_IDS) { val b = (x10 / 10) * 10; v["temp"] = b; v["ac_tempdec"] = if (x10 - b >= 5) 1 else 0 }
+                        else v["temp"] = x10
+                    }
+                    if (s.fan != prev.fan) v["ac_mark"] = when (s.fan) { Fan.AUTO -> 0; Fan.LOW -> 1; Fan.MED -> 2; Fan.HIGH -> 3; Fan.TURBO -> 4 }
+                    if (s.swingV != prev.swingV) v["ac_vdir"] = if (s.swingV) 1 else 0
+                    if (s.swingH != prev.swingH) v["ac_hdir"] = if (s.swingH) 1 else 0
+                    if (s.sleep != prev.sleep) v["ac_slp"] = if (s.sleep) 1 else 0
+                    if (s.health != prev.health) v["ac_health"] = if (s.health) 1 else 0
+                    if (s.clean != prev.clean) v["ac_clean"] = if (s.clean) 1 else 0
+                    if (s.display != prev.display) v["scrdisp"] = if (s.display) 1 else 0
+                    if (v.isNotEmpty()) call(d, "set", v.keys.toList(), v.values.toList())
+                    last = s
+                }
+            }
         }
     }
-    out
 }
