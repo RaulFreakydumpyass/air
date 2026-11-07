@@ -40,14 +40,20 @@ import kotlin.math.*
 enum class Mode(val label: String, val icon: String) {
     AUTO("Auto", "✦"), COOL("Cool", "❄"), DRY("Dry", "💧"), HEAT("Heat", "☀"), FAN("Fan", "🌀")
 }
-enum class Fan(val label: String) { AUTO("Auto"), MUTE("Mute"), LOW("Low"), MED("Medium"), HIGH("High"), TURBO("Turbo") }
+enum class Fan(val label: String) { AUTO("Auto"), LOW("Low"), MED("Medium"), HIGH("High"), TURBO("Turbo") }
 
 data class AcState(
     val power: Boolean = true, val mode: Mode = Mode.COOL, val target: Float = 24f, val room: Float = 27.5f,
-    val fan: Fan = Fan.AUTO, val swingV: Boolean = false, val swingH: Boolean = false,
-    val eco: Boolean = false, val sleep: Boolean = false, val health: Boolean = false,
-    val clean: Boolean = false, val mildew: Boolean = false, val childLock: Boolean = false,
-    val comfort: Boolean = false, val display: Boolean = true,
+    val humidity: Int = 48, val fan: Fan = Fan.AUTO, val swingV: Boolean = false, val swingH: Boolean = false,
+    val sleep: Boolean = false, val curve: Int = 2, val health: Boolean = false, val clean: Boolean = false,
+    val display: Boolean = true, val timerOff: Int = 0,
+)
+
+/** Sleep curves: how far the temperature drifts from your setting, hour by hour over 8 hours. */
+val CURVES = listOf(
+    "Steady" to listOf(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f),
+    "Light" to listOf(0f, 0f, 1f, 1f, 1f, 1f, 0f, 0f),
+    "Standard" to listOf(0f, 1f, 2f, 2f, 2f, 2f, 1f, 0f),
 )
 
 /** The only thing that touches the air conditioner. Swap DemoBackend for a real one (AUX Cloud or LAN). */
@@ -159,6 +165,13 @@ fun App(backend: AcBackend) {
     LaunchedEffect(Unit) { while (true) { st = backend.read(); delay(5000) } }
     fun set(n: AcState) { st = n; scope.launch { backend.write(n) } }
 
+    LaunchedEffect(st.timerOff > 0) {
+        while (st.timerOff > 0) {
+            delay(60_000)
+            if (st.timerOff > 1) set(st.copy(timerOff = st.timerOff - 1)) else set(st.copy(timerOff = 0, power = false))
+        }
+    }
+
     val cols = palette(st).map { animateColorAsState(it, tween(1200), label = "c").value }
     val phase = rememberInfiniteTransition(label = "p")
         .animateFloat(0f, 1f, infiniteRepeatable(tween(30000, easing = LinearEasing)), label = "ph")
@@ -167,10 +180,8 @@ fun App(backend: AcBackend) {
 
     val verb = when (st.mode) { Mode.COOL -> "cooling to"; Mode.HEAT -> "heating to"; Mode.DRY -> "drying toward"; Mode.AUTO -> "holding"; Mode.FAN -> "moving air at" }
     val feats = listOf(
-        Feat("Eco", st.eco) { it.copy(eco = !it.eco) }, Feat("Sleep", st.sleep) { it.copy(sleep = !it.sleep) },
-        Feat("Health", st.health) { it.copy(health = !it.health) }, Feat("Self clean", st.clean) { it.copy(clean = !it.clean) },
-        Feat("Mildew proof", st.mildew) { it.copy(mildew = !it.mildew) }, Feat("Child lock", st.childLock) { it.copy(childLock = !it.childLock) },
-        Feat("Comfort wind", st.comfort) { it.copy(comfort = !it.comfort) }, Feat("Screen light", st.display) { it.copy(display = !it.display) },
+        Feat("Sleep", st.sleep) { it.copy(sleep = !it.sleep) }, Feat("Health", st.health) { it.copy(health = !it.health) },
+        Feat("Self clean", st.clean) { it.copy(clean = !it.clean) }, Feat("Unit display", st.display) { it.copy(display = !it.display) },
     )
 
     CompositionLocalProvider(LocalBg provides bg, LocalScreen provides screen) {
@@ -184,7 +195,7 @@ fun App(backend: AcBackend) {
                 Column(Modifier.padding(start = 6.dp, top = 8.dp)) {
                     Text("Air conditioner", color = Color.White, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
                     Text(
-                        if (st.power) "Room is ${fmt(st.room)}°, $verb ${fmt(st.target)}°" else "Off, room is ${fmt(st.room)}°",
+                        if (st.power) "Room ${fmt(st.room)}° and ${st.humidity}% humidity, $verb ${fmt(st.target)}°" else "Off, room ${fmt(st.room)}° and ${st.humidity}% humidity",
                         color = Color.White.copy(.75f), fontSize = 15.sp
                     )
                 }
@@ -234,12 +245,47 @@ fun App(backend: AcBackend) {
                 }
 
                 Glass(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text(
+                            if (st.timerOff > 0) "Turns off in ${st.timerOff / 60}h ${st.timerOff % 60}m" else "Turn off after",
+                            color = Color.White.copy(.8f), fontSize = 14.sp
+                        )
+                        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            listOf(0 to "No timer", 30 to "30 min", 60 to "1 hour", 120 to "2 hours", 240 to "4 hours", 480 to "8 hours").forEach { (m, l) ->
+                                Pill(l, m == 0 && st.timerOff == 0) { set(st.copy(timerOff = m)) }
+                            }
+                        }
+                    }
+                }
+
+                Glass(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text("Comfort and care", color = Color.White.copy(.8f), fontSize = 14.sp)
                         feats.chunked(2).forEach { row ->
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 row.forEach { f -> Pill(f.label, f.on, Modifier.weight(1f)) { set(f.toggle(st)) } }
                             }
+                        }
+                    }
+                }
+
+                if (st.sleep) Glass(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text("Sleep curve over 8 hours", color = Color.White.copy(.8f), fontSize = 14.sp)
+                        Canvas(Modifier.fillMaxWidth().height(70.dp)) {
+                            val pts = CURVES[st.curve].second
+                            val step = size.width / (pts.size - 1)
+                            val pad = 6.dp.toPx()
+                            val path = androidx.compose.ui.graphics.Path()
+                            pts.forEachIndexed { i, v ->
+                                val x = i * step
+                                val y = size.height - pad - (v / 2f) * (size.height - 2 * pad)
+                                if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                            }
+                            drawPath(path, Color.White, style = Stroke(3.dp.toPx(), cap = StrokeCap.Round))
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            CURVES.forEachIndexed { i, c -> Pill(c.first, st.curve == i, Modifier.weight(1f)) { set(st.copy(curve = i)) } }
                         }
                     }
                 }
