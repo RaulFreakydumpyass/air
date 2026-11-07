@@ -32,7 +32,15 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.*
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.net.SocketTimeoutException
+import java.util.Calendar
+import java.util.TimeZone
 import kotlinx.coroutines.launch
 import kotlin.math.*
 
@@ -164,6 +172,19 @@ fun App(backend: AcBackend) {
     val scope = rememberCoroutineScope()
     LaunchedEffect(Unit) { while (true) { st = backend.read(); delay(5000) } }
     fun set(n: AcState) { st = n; scope.launch { backend.write(n) } }
+    var scanning by remember { mutableStateOf(false) }
+    var scanText by remember { mutableStateOf("") }
+    fun scan() {
+        scanning = true; scanText = "Searching for 5 seconds..."
+        scope.launch {
+            scanText = try {
+                val r = scanLan()
+                if (r.isEmpty()) "Nothing answered. Check the phone is on the same Wi-Fi as the AC. Some units don't answer this search."
+                else r.joinToString("\n") { "Found ${it.name.ifBlank { "a device" }} at ${it.ip}, type 0x${it.type.toString(16).uppercase()}, ${if (it.locked) "locked" else "unlocked"}" }
+            } catch (e: Exception) { "Search failed: ${e.message}" }
+            scanning = false
+        }
+    }
 
     LaunchedEffect(st.timerOff > 0) {
         while (st.timerOff > 0) {
@@ -290,6 +311,14 @@ fun App(backend: AcBackend) {
                     }
                 }
 
+                Glass(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text("Connection", color = Color.White.copy(.8f), fontSize = 14.sp)
+                        Pill(if (scanning) "Searching..." else "Find my AC on Wi-Fi", false, Modifier.fillMaxWidth()) { if (!scanning) scan() }
+                        if (scanText.isNotEmpty()) Text(scanText, color = Color.White, fontSize = 13.sp)
+                    }
+                }
+
                 Text(
                     "Demo mode: changes are not sent to your air conditioner yet.",
                     color = Color.White.copy(.55f), fontSize = 12.sp, modifier = Modifier.padding(start = 6.dp, bottom = 12.dp)
@@ -309,4 +338,49 @@ class MainActivity : ComponentActivity() {
         )
         setContent { App(backend) }
     }
+}
+
+// ---------- Wi-Fi search (read-only: only looks for devices, changes nothing) ----------
+data class Found(val ip: String, val type: Int, val name: String, val locked: Boolean)
+
+suspend fun scanLan(): List<Found> = withContext(Dispatchers.IO) {
+    val out = mutableListOf<Found>()
+    DatagramSocket(0).use { sock ->
+        sock.broadcast = true
+        sock.soTimeout = 1000
+        val p = ByteArray(0x30)
+        val now = Calendar.getInstance()
+        val tz = TimeZone.getDefault().getOffset(now.timeInMillis) / 3600000
+        for (i in 0..3) p[8 + i] = ((tz shr (8 * i)) and 0xff).toByte()
+        val y = now.get(Calendar.YEAR)
+        p[0x0c] = (y and 0xff).toByte(); p[0x0d] = ((y shr 8) and 0xff).toByte()
+        p[0x0e] = now.get(Calendar.MINUTE).toByte(); p[0x0f] = now.get(Calendar.HOUR_OF_DAY).toByte()
+        p[0x10] = (y % 100).toByte()
+        p[0x11] = ((now.get(Calendar.DAY_OF_WEEK) + 5) % 7 + 1).toByte()
+        p[0x12] = now.get(Calendar.DAY_OF_MONTH).toByte(); p[0x13] = (now.get(Calendar.MONTH) + 1).toByte()
+        val lp = sock.localPort
+        p[0x1c] = (lp and 0xff).toByte(); p[0x1d] = ((lp shr 8) and 0xff).toByte()
+        p[0x26] = 6
+        var sum = 0xbeaf
+        for (b in p) sum += (b.toInt() and 0xff)
+        sum = sum and 0xffff
+        p[0x20] = (sum and 0xff).toByte(); p[0x21] = ((sum shr 8) and 0xff).toByte()
+        val addr = InetAddress.getByName("255.255.255.255")
+        repeat(2) { sock.send(DatagramPacket(p, p.size, addr, 80)) }
+        val end = System.currentTimeMillis() + 5000
+        val buf = ByteArray(1024)
+        while (System.currentTimeMillis() < end) {
+            try {
+                val r = DatagramPacket(buf, buf.size)
+                sock.receive(r)
+                if (r.length < 0x40) continue
+                val d = buf.copyOf(r.length)
+                val type = (d[0x34].toInt() and 0xff) or ((d[0x35].toInt() and 0xff) shl 8)
+                val name = String(d.copyOfRange(0x40, d.size).takeWhile { it.toInt() != 0 }.toByteArray(), Charsets.UTF_8)
+                val f = Found(r.address.hostAddress ?: "?", type, name, d.last().toInt() != 0)
+                if (out.none { it.ip == f.ip }) out.add(f)
+            } catch (e: SocketTimeoutException) { }
+        }
+    }
+    out
 }
