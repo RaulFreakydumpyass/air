@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <color name="aircon_primary">#1976D2</color>
-    <color name="aircon_primary_dark">#0D47A1</color>
-    <color name="aircon_secondary">#26A69A</color>
-    <color name="aircon_icon_background">#1976D2</color>
-    <color name="aircon_white">#FFFFFF</color>
-</resources>
